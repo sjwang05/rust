@@ -137,12 +137,12 @@ use rustc_index::bit_set::BitSet;
 use rustc_index::interval::SparseIntervalMatrix;
 use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
-use rustc_middle::mir::HasLocalDecls;
 use rustc_middle::mir::{dump_mir, PassWhere};
 use rustc_middle::mir::{
     traversal, Body, InlineAsmOperand, Local, LocalKind, Location, Operand, Place, Rvalue,
     Statement, StatementKind, TerminatorKind,
 };
+use rustc_middle::mir::{HasLocalDecls, ProjectionElem};
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::impls::MaybeLiveLocals;
 use rustc_mir_dataflow::points::{save_as_intervals, DenseLocationMap, PointIndex};
@@ -222,7 +222,8 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
                 if merged_locals.contains(*src) {
                     continue;
                 }
-                let Some(dest) = candidates.iter().find(|dest| !merged_locals.contains(**dest))
+                let Some((dest, place)) =
+                    candidates.iter().find(|(dest, _)| !merged_locals.contains(*dest))
                 else {
                     continue;
                 };
@@ -233,7 +234,7 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
                 }
 
                 // Replace `src` by `dest` everywhere.
-                merges.insert(*src, *dest);
+                merges.insert(*src, (*dest, *place));
                 merged_locals.insert(*src);
                 merged_locals.insert(*dest);
 
@@ -260,15 +261,15 @@ impl<'tcx> MirPass<'tcx> for DestinationPropagation {
 /// We store these here and hand out `&mut` access to them, instead of dropping and recreating them
 /// frequently. Everything with a `&'alloc` lifetime points into here.
 #[derive(Default)]
-struct Allocations {
-    candidates: FxIndexMap<Local, Vec<Local>>,
-    candidates_reverse: FxIndexMap<Local, Vec<Local>>,
+struct Allocations<'tcx> {
+    candidates: FxIndexMap<Local, Vec<(Local, Place<'tcx>)>>,
+    candidates_reverse: FxIndexMap<(Local, Place<'tcx>), Vec<Local>>,
     write_info: WriteInfo,
     // PERF: Do this for `MaybeLiveLocals` allocations too.
 }
 
 #[derive(Debug)]
-struct Candidates<'alloc> {
+struct Candidates<'alloc, 'tcx> {
     /// The set of candidates we are considering in this optimization.
     ///
     /// We will always merge the key into at most one of its values.
@@ -283,11 +284,11 @@ struct Candidates<'alloc> {
     ///
     /// We will still report that we would like to merge `_1` and `_2` in an attempt to allow us to
     /// remove that assignment.
-    c: &'alloc mut FxIndexMap<Local, Vec<Local>>,
+    c: &'alloc mut FxIndexMap<Local, Vec<(Local, Place<'tcx>)>>,
     /// A reverse index of the `c` set; if the `c` set contains `a => Place { local: b, proj }`,
     /// then this contains `b => a`.
     // PERF: Possibly these should be `SmallVec`s?
-    reverse: &'alloc mut FxIndexMap<Local, Vec<Local>>,
+    reverse: &'alloc mut FxIndexMap<(Local, Place<'tcx>), Vec<Local>>,
 }
 
 //////////////////////////////////////////////////////////
@@ -298,7 +299,7 @@ struct Candidates<'alloc> {
 fn apply_merges<'tcx>(
     body: &mut Body<'tcx>,
     tcx: TyCtxt<'tcx>,
-    merges: &FxIndexMap<Local, Local>,
+    merges: &FxIndexMap<Local, (Local, Place<'tcx>)>,
     merged_locals: &BitSet<Local>,
 ) {
     let mut merger = Merger { tcx, merges, merged_locals };
@@ -307,7 +308,7 @@ fn apply_merges<'tcx>(
 
 struct Merger<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    merges: &'a FxIndexMap<Local, Local>,
+    merges: &'a FxIndexMap<Local, (Local, Place<'tcx>)>,
     merged_locals: &'a BitSet<Local>,
 }
 
@@ -316,12 +317,26 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Merger<'a, 'tcx> {
         self.tcx
     }
 
-    fn visit_local(&mut self, local: &mut Local, _: PlaceContext, _location: Location) {
-        if let Some(dest) = self.merges.get(local) {
+    #[instrument(level = "trace", skip(self, context, location))]
+    fn visit_place(&mut self, place: &mut Place<'tcx>, context: PlaceContext, location: Location) {
+        let old_local = place.local;
+        self.super_place(place, context, location);
+        if let Some((_, dest)) = self.merges.get(&old_local) {
+            if !dest.projection.is_empty() {
+                trace!("Replacing projections for {place:?}");
+                place.projection = dest.projection;
+            }
+        }
+    }
+
+    #[instrument(level = "trace", skip(self))]
+    fn visit_local(&mut self, local: &mut Local, _: PlaceContext, _: Location) {
+        if let Some((dest, _)) = self.merges.get(local) {
             *local = *dest;
         }
     }
 
+    #[instrument(level = "trace", skip(self, location))]
     fn visit_statement(&mut self, statement: &mut Statement<'tcx>, location: Location) {
         match &statement.kind {
             // FIXME: Don't delete storage statements, but "merge" the storage ranges instead.
@@ -364,7 +379,7 @@ struct FilterInformation<'a, 'body, 'alloc, 'tcx> {
     body: &'body Body<'tcx>,
     points: &'a DenseLocationMap,
     live: &'a SparseIntervalMatrix<Local, PointIndex>,
-    candidates: &'a mut Candidates<'alloc>,
+    candidates: &'a mut Candidates<'alloc, 'tcx>,
     write_info: &'alloc mut WriteInfo,
     at: Location,
 }
@@ -372,18 +387,18 @@ struct FilterInformation<'a, 'body, 'alloc, 'tcx> {
 // We first implement some utility functions which we will expose removing candidates according to
 // different needs. Throughout the liveness filtering, the `candidates` are only ever accessed
 // through these methods, and not directly.
-impl<'alloc> Candidates<'alloc> {
+impl<'alloc, 'tcx> Candidates<'alloc, 'tcx> {
     /// Just `Vec::retain`, but the condition is inverted and we add debugging output
     fn vec_filter_candidates(
         src: Local,
-        v: &mut Vec<Local>,
+        v: &mut Vec<(Local, Place<'tcx>)>,
         mut f: impl FnMut(Local) -> CandidateFilter,
         at: Location,
     ) {
-        v.retain(|dest| {
+        v.retain(|(dest, _)| {
             let remove = f(*dest);
             if remove == CandidateFilter::Remove {
-                trace!("eliminating {:?} => {:?} due to conflict at {:?}", src, dest, at);
+                trace!("eliminating {src:?} => {dest:?} due to conflict at {at:?}");
             }
             remove == CandidateFilter::Keep
         });
@@ -391,7 +406,7 @@ impl<'alloc> Candidates<'alloc> {
 
     /// `vec_filter_candidates` but for an `Entry`
     fn entry_filter_candidates(
-        mut entry: IndexOccupiedEntry<'_, Local, Vec<Local>>,
+        mut entry: IndexOccupiedEntry<'_, Local, Vec<(Local, Place<'tcx>)>>,
         p: Local,
         f: impl FnMut(Local) -> CandidateFilter,
         at: Location,
@@ -415,29 +430,34 @@ impl<'alloc> Candidates<'alloc> {
         if let IndexEntry::Occupied(entry) = self.c.entry(p) {
             Self::entry_filter_candidates(entry, p, &mut f, at);
         }
+
         // And the cases where `p` appears as a `dest`
-        let Some(srcs) = self.reverse.get_mut(&p) else {
-            return;
-        };
-        // We use `retain` here to remove the elements from the reverse set if we've removed the
-        // matching candidate in the forward set.
-        srcs.retain(|src| {
-            if f(*src) == CandidateFilter::Keep {
-                return true;
-            }
-            let IndexEntry::Occupied(entry) = self.c.entry(*src) else {
-                return false;
+        let mut keys = self.reverse.keys().copied().collect::<Vec<_>>();
+        keys.retain(|(local, _)| *local == p);
+        for key in keys {
+            let Some(srcs) = self.reverse.get_mut(&key) else {
+                return;
             };
-            Self::entry_filter_candidates(
-                entry,
-                *src,
-                |dest| {
-                    if dest == p { CandidateFilter::Remove } else { CandidateFilter::Keep }
-                },
-                at,
-            );
-            false
-        });
+            // We use `retain` here to remove the elements from the reverse set if we've removed the
+            // matching candidate in the forward set.
+            srcs.retain(|src| {
+                if f(*src) == CandidateFilter::Keep {
+                    return true;
+                }
+                let IndexEntry::Occupied(entry) = self.c.entry(*src) else {
+                    return false;
+                };
+                Self::entry_filter_candidates(
+                    entry,
+                    *src,
+                    |dest| {
+                        if dest == p { CandidateFilter::Remove } else { CandidateFilter::Keep }
+                    },
+                    at,
+                );
+                false
+            });
+        }
     }
 }
 
@@ -466,7 +486,7 @@ impl<'a, 'body, 'alloc, 'tcx> FilterInformation<'a, 'body, 'alloc, 'tcx> {
     /// statement/terminator to be live. We are additionally conservative by treating all written to
     /// locals as also being read from.
     fn filter_liveness<'b>(
-        candidates: &mut Candidates<'alloc>,
+        candidates: &mut Candidates<'alloc, 'tcx>,
         points: &DenseLocationMap,
         live: &SparseIntervalMatrix<Local, PointIndex>,
         write_info_alloc: &'alloc mut WriteInfo,
@@ -704,12 +724,37 @@ impl WriteInfo {
 /// merging - candidate collection must still check this independently.
 ///
 /// This output is unique for each unordered pair of input places.
+#[instrument(level = "trace", skip(body), ret)]
 fn places_to_candidate_pair<'tcx>(
     a: Place<'tcx>,
     b: Place<'tcx>,
     body: &Body<'tcx>,
 ) -> Option<(Local, Local)> {
-    let (mut a, mut b) = if a.projection.len() == 0 && b.projection.len() == 0 {
+    let valid = a.projection.is_empty()
+        && (b
+            .projection
+            .iter()
+            .all(|p| matches!(p, ProjectionElem::Field(..) | ProjectionElem::Deref))
+            || matches!(
+                b.projection[..],
+                [] | [ProjectionElem::Index(..)]
+                    | [ProjectionElem::Deref, ProjectionElem::Index(..)]
+            ))
+        || b.projection.is_empty()
+            && (a
+                .projection
+                .iter()
+                .all(|p| matches!(p, ProjectionElem::Field(..) | ProjectionElem::Deref))
+                || matches!(
+                    a.projection[..],
+                    [] | [ProjectionElem::Index(..)]
+                        | [ProjectionElem::Deref, ProjectionElem::Index(..)]
+                ));
+    let (mut a, mut b) = if valid {
+        debug_assert!(
+            a.projection.is_empty() || b.projection.is_empty(),
+            "only one of (a, b) should have projections"
+        );
         (a.local, b.local)
     } else {
         return None;
@@ -717,12 +762,14 @@ fn places_to_candidate_pair<'tcx>(
 
     // By sorting, we make sure we're input order independent
     if a > b {
+        trace!("swapping a and b: a > b");
         std::mem::swap(&mut a, &mut b);
     }
 
     // We could now return `(a, b)`, but then we miss some candidates in the case where `a` can't be
     // used as a `src`.
     if is_local_required(a, body) {
+        trace!("swapping a and b: a is required, so we can only use it as a `dest`");
         std::mem::swap(&mut a, &mut b);
     }
     // We could check `is_local_required` again here, but there's no need - after all, we make no
@@ -733,19 +780,20 @@ fn places_to_candidate_pair<'tcx>(
 /// Collects the candidates for merging
 ///
 /// This is responsible for enforcing the first and third bullet point.
+#[instrument(level = "trace", skip(body, borrowed, candidates, candidates_reverse))]
 fn find_candidates<'alloc, 'tcx>(
     body: &Body<'tcx>,
     borrowed: &BitSet<Local>,
-    candidates: &'alloc mut FxIndexMap<Local, Vec<Local>>,
-    candidates_reverse: &'alloc mut FxIndexMap<Local, Vec<Local>>,
-) -> Candidates<'alloc> {
+    candidates: &'alloc mut FxIndexMap<Local, Vec<(Local, Place<'tcx>)>>,
+    candidates_reverse: &'alloc mut FxIndexMap<(Local, Place<'tcx>), Vec<Local>>,
+) -> Candidates<'alloc, 'tcx> {
     candidates.clear();
     candidates_reverse.clear();
     let mut visitor = FindAssignments { body, candidates, borrowed };
     visitor.visit_body(body);
     // Deduplicate candidates
     for (_, cands) in candidates.iter_mut() {
-        cands.sort();
+        cands.sort_by_key(|(local, _)| *local);
         cands.dedup();
     }
     // Generate the reverse map
@@ -759,44 +807,90 @@ fn find_candidates<'alloc, 'tcx>(
 
 struct FindAssignments<'a, 'alloc, 'tcx> {
     body: &'a Body<'tcx>,
-    candidates: &'alloc mut FxIndexMap<Local, Vec<Local>>,
+    candidates: &'alloc mut FxIndexMap<Local, Vec<(Local, Place<'tcx>)>>,
     borrowed: &'a BitSet<Local>,
 }
 
 impl<'tcx> Visitor<'tcx> for FindAssignments<'_, '_, 'tcx> {
-    fn visit_statement(&mut self, statement: &Statement<'tcx>, _: Location) {
+    #[instrument(level = "trace", skip(self, location))]
+    fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         if let StatementKind::Assign(box (
             lhs,
             Rvalue::CopyForDeref(rhs) | Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)),
         )) = &statement.kind
         {
-            let Some((src, dest)) = places_to_candidate_pair(*lhs, *rhs, self.body) else {
+            let Some((mut src, mut dest)) = places_to_candidate_pair(*lhs, *rhs, self.body) else {
                 return;
             };
+
+            self.super_statement(statement, location);
+
+            // We only want to consider situations where the projection is `dest`. Similarly,
+            // if the projection is the lhs of the assign but `places_to_candidate_pair` returned
+            // it as the `src`, we want to reverse this change.
+            if !lhs.projection.is_empty() && lhs.local == src {
+                trace!("swapping dest and src: {dest:?} = {src:?} -> {src:?} = {dest:?}");
+                std::mem::swap(&mut src, &mut dest);
+            }
+
+            // Now that we've ensured projections appear as the `dest`, skip `src`s where we
+            // could end up replacing projections with locals.
+            if !rhs.projection.is_empty() && rhs.local == src {
+                trace!("skipped {rhs:?} because it is a src with projections.");
+                return;
+            }
 
             // As described at the top of the file, we do not go near things that have
             // their address taken.
             if self.borrowed.contains(src) || self.borrowed.contains(dest) {
+                if self.borrowed.contains(src) {
+                    trace!("skipped src {src:?} because it is borrowed");
+                }
+                if self.borrowed.contains(dest) {
+                    trace!("skipped dest {dest:?} because it is borrowed");
+                }
                 return;
             }
 
             // As described at the top of this file, we do not touch locals which have
             // different types.
             let src_ty = self.body.local_decls()[src].ty;
-            let dest_ty = self.body.local_decls()[dest].ty;
+            let dest_ty = if let Some(ProjectionElem::Field(_, dest_ty)) = lhs.projection.last() {
+                *dest_ty
+            } else {
+                self.body.local_decls()[dest].ty
+            };
+            if let Some(ProjectionElem::Field(_, ty)) = lhs.projection.last() {
+                trace!("dest_ty with projections == src_ty: {ty} == {src_ty}: {}", src_ty == *ty);
+            }
             if src_ty != dest_ty {
                 // FIXME(#112651): This can be removed afterwards. Also update the module description.
-                trace!("skipped `{src:?} = {dest:?}` due to subtyping: {src_ty} != {dest_ty}");
+                debug!("skipped `{dest:?} = {src:?}` due to subtyping: {dest_ty} != {src_ty}");
                 return;
             }
 
             // Also, we need to make sure that MIR actually allows the `src` to be removed
             if is_local_required(src, self.body) {
+                trace!("skipped {src:?}: {src:?} is required");
                 return;
             }
 
             // We may insert duplicates here, but that's fine
-            self.candidates.entry(src).or_default().push(dest);
+            let place = if lhs.local == dest {
+                debug_assert!(
+                    rhs.projection.is_empty(),
+                    "at most one place should have projections"
+                );
+                lhs
+            } else {
+                debug_assert!(
+                    lhs.projection.is_empty(),
+                    "at most one place should have projections"
+                );
+                rhs
+            };
+            trace!("({src:?}, ({dest:?}, {place:?})) is a candidate pair");
+            self.candidates.entry(src).or_default().push((dest, *place));
         }
     }
 }

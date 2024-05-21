@@ -1,0 +1,68 @@
+- // MIR for `fields` before DestinationPropagation
++ // MIR for `fields` after DestinationPropagation
+  
+  fn fields() -> u8 {
+      let mut _0: u8;
+      let mut _1: Foo;
+      let mut _5: u8;
+      let mut _6: u8;
+      scope 1 {
+          debug foo => _1;
+          let _2: u8;
+          scope 2 {
+-             debug n => _2;
++             debug n => _5;
+              let mut _3: u8;
+              scope 3 {
+-                 debug n1 => _3;
++                 debug n1 => _5;
+                  let mut _4: u8;
+                  scope 4 {
+-                     debug n2 => _4;
++                     debug n2 => _6;
+                  }
+              }
+          }
+      }
+  
+      bb0: {
+          StorageLive(_1);
+          _1 = Foo { n1: const 0_u8, n2: const 0_u8 };
+-         StorageLive(_2);
+-         _2 = const 0_u8;
+-         StorageLive(_3);
+-         _3 = _2;
+-         StorageLive(_4);
+-         _4 = const 2_u8;
+-         StorageLive(_5);
+-         _5 = _3;
++         nop;
++         _5 = const 0_u8;
++         nop;
++         nop;
++         nop;
++         _6 = const 2_u8;
++         nop;
++         nop;
+          (_1.0: u8) = move _5;
+-         StorageDead(_5);
+-         StorageLive(_6);
+-         _6 = _4;
++         nop;
++         nop;
++         nop;
+          (_1.1: u8) = move _6;
+-         StorageDead(_6);
++         nop;
+          _0 = (_1.0: u8);
+-         StorageDead(_4);
+-         StorageDead(_3);
+-         StorageDead(_2);
++         nop;
++         nop;
++         nop;
+          StorageDead(_1);
+          return;
+      }
+  }
+  

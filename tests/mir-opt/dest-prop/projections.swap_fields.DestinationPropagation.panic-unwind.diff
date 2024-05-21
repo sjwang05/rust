@@ -1,0 +1,49 @@
+- // MIR for `swap_fields` before DestinationPropagation
++ // MIR for `swap_fields` after DestinationPropagation
+  
+  fn swap_fields() -> u8 {
+      let mut _0: u8;
+      let mut _1: Foo;
+      let mut _3: u8;
+      let mut _4: u8;
+      scope 1 {
+          debug foo => _1;
+          let _2: u8;
+          scope 2 {
+-             debug temp => _2;
++             debug temp => _4;
+          }
+      }
+  
+      bb0: {
+-         StorageLive(_1);
++         nop;
+          _1 = Foo { n1: const 0_u8, n2: const 1_u8 };
+-         StorageLive(_2);
+-         _2 = (_1.0: u8);
+-         StorageLive(_3);
+-         _3 = (_1.1: u8);
+-         (_1.0: u8) = move _3;
+-         StorageDead(_3);
+-         StorageLive(_4);
+-         _4 = _2;
++         nop;
++         _4 = (_1.0: u8);
++         nop;
++         (_1.0: u8) = (_1.1: u8);
++         nop;
++         nop;
++         nop;
++         nop;
+          (_1.1: u8) = move _4;
+-         StorageDead(_4);
++         nop;
+          _0 = (_1.0: u8);
+-         StorageDead(_2);
+-         StorageDead(_1);
++         nop;
++         nop;
+          return;
+      }
+  }
+  
